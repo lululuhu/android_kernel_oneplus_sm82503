@@ -12,12 +12,13 @@ env:
   KERNEL_REPO: https://github.com/OnePlusOSS/android_kernel_oneplus_sm8250.git
   KERNEL_BRANCH: oneplus/sm8250_u_14.0.0_op9r
   DEFCONFIG: vendor/kona-perf_defconfig
+  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487747c.tar.gz
 
 jobs:
   build:
-    name: build-baseline
+    name: build-kona
     runs-on: ubuntu-22.04
-    timeout-minutes: 300
+    timeout-minutes: 330
     steps:
       - name: checkout ci
         uses: actions/checkout@v4
@@ -28,106 +29,104 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            bc bison flex libssl-dev libelf-dev zip unzip cpio rsync \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu device-tree-compiler lz4
+            bc bison flex libssl-dev libelf-dev zip unzip cpio rsync lz4 \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi device-tree-compiler
+          echo "---- cross gcc ----"
           aarch64-linux-gnu-gcc --version | head -1
+
+      - name: cache aosp clang
+        uses: actions/cache@v4
+        with:
+          path: ~/clang
+          key: clang-r487747c-v1
+
+      - name: fetch aosp clang
+        run: |
+          if [ ! -x "$HOME/clang/bin/clang" ]; then
+            rm -rf "$HOME/clang"; mkdir -p "$HOME/clang"
+            curl -sL "$CLANG_URL" | tar -xz -C "$HOME/clang"
+          fi
+          "$HOME/clang/bin/clang" --version | head -3
 
       - name: clone kernel
         run: |
           git clone --depth 1 --single-branch -b "$KERNEL_BRANCH" "$KERNEL_REPO" kona
           git -C kona log -1 --format='%H %s' | tee ci/kernel-commit.txt
 
+      - name: build BASELINE Image.gz (no patches)
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          export PATH="$HOME/clang/bin:$PATH"
+          M="O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+             CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          make -C kona $M "$DEFCONFIG" 2>&1 | tail -n 20
+          make -C kona $M KCFLAGS="-Wno-error" -j"$(nproc)" Image.gz 2>&1 | tee ci/build-baseline.log | tail -n 30
+          mkdir -p ci/artifact/baseline
+          cp kona/out/arch/arm64/boot/Image.gz ci/artifact/baseline/
+          cp kona/out/.config ci/artifact/baseline/kona-perf_defconfig.used
+          tail -n 400 ci/build-baseline.log > ci/artifact/baseline/build-tail.log
+          echo "BASELINE OK"
+
       - name: apply ohos patches
         run: |
           cd kona
+          git config user.email ci@local
+          git config user.name ci
           : > ../ci/patch-report.txt
           shopt -s nullglob
           for p in ../ci/patches/*.patch; do
             n=$(basename "$p")
             if git apply --check "$p" >/dev/null 2>&1; then
               git apply "$p" && echo "APPLIED    $n" >> ../ci/patch-report.txt
-            elif patch -p1 --forward --fuzz=3 --no-backup-if-mismatch < "$p" >/dev/null 2>&1; then
-              echo "APPLIED-FZ $n" >> ../ci/patch-report.txt
             else
-              git checkout -- . 2>/dev/null
-              git clean -fdq 2>/dev/null
-              echo "SKIPPED    $n" >> ../ci/patch-report.txt
+              rm -rf /tmp/rej && mkdir -p /tmp/rej
+              patch -p1 --forward --fuzz=3 --no-backup-if-mismatch -r /tmp/rej < "$p" > /tmp/po 2>&1 || true
+              if [ -n "$(ls -A /tmp/rej 2>/dev/null)" ]; then
+                git checkout -- . 2>/dev/null
+                git clean -fdq 2>/dev/null
+                echo "REVERTED   $n" >> ../ci/patch-report.txt
+                continue
+              fi
+              echo "APPLIED-FZ $n" >> ../ci/patch-report.txt
             fi
+            git add -A >/dev/null 2>&1
+            git commit -qm "apply $n" --allow-empty >/dev/null 2>&1
           done
           cat ../ci/patch-report.txt
 
-      - name: defconfig
-        run: |
-          make -C kona O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- "$DEFCONFIG"
-          grep -E 'CONFIG_ACCESS_TOKENID|CONFIG_BINDER_SENDER_INFO|CONFIG_OHOS' kona/out/.config || true
-
-      - name: build Image.gz
+      - name: build PATCHED Image.gz (with ohos config)
         run: |
           set -o pipefail
-          make -C kona O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-            KCFLAGS="-Wno-error" -j"$(nproc)" Image.gz 2>&1 | tee ci/build.log | tail -n 40
-
-      - name: build dtbs (optional)
-        continue-on-error: true
-        run: |
-          set -o pipefail
-          make -C kona O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-            KCFLAGS="-Wno-error" -j"$(nproc)" dtbs 2>&1 | tee ci/build-dtbs.log | tail -n 20
+          export PATH="$HOME/clang/bin:$PATH"
+          M="O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+             CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          make -C kona $M "$DEFCONFIG" 2>&1 | tail -n 5
+          if make -C kona $M vendor/ohos.config 2>&1 | tail -n 5; then
+            echo "ohos.config merged via make target"
+          else
+            cat kona/arch/arm64/configs/vendor/ohos.config >> kona/out/.config
+            echo "ohos.config appended manually"
+          fi
+          make -C kona $M olddefconfig 2>&1 | tail -n 5
+          grep -E 'CONFIG_ACCESS_TOKENID|CONFIG_BINDER_SENDER_INFO|CONFIG_OHOS|CONFIG_DM_PARTNAME' kona/out/.config >> ci/patch-report.txt || true
+          make -C kona $M KCFLAGS="-Wno-error" -j"$(nproc)" Image.gz 2>&1 | tee ci/build-patched.log | tail -n 30
+          mkdir -p ci/artifact/patched
+          cp kona/out/arch/arm64/boot/Image.gz ci/artifact/patched/
+          cp kona/out/.config ci/artifact/patched/kona-ohos_defconfig.used
+          tail -n 400 ci/build-patched.log > ci/artifact/patched/build-tail.log
 
       - name: collect
         if: always()
         run: |
-          mkdir -p ci/artifact
-          cp kona/out/arch/arm64/boot/Image.gz ci/artifact/ 2>/dev/null || true
-          cp kona/out/arch/arm64/boot/Image ci/artifact/ 2>/dev/null || true
-          cp kona/out/.config ci/artifact/kona-perf_defconfig.used 2>/dev/null || true
-          find kona/out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} ci/artifact/ \; 2>/dev/null || true
-          tail -n 300 ci/build.log > ci/artifact/build-tail.log 2>/dev/null || true
           cp ci/patch-report.txt ci/artifact/ 2>/dev/null || true
-          cd ci/artifact && md5sum * > MD5.txt && cat MD5.txt
+          cp ci/build-patched.log ci/artifact/ 2>/dev/null || true
+          cd ci/artifact && find . -type f -exec md5sum {} \; | sort > MD5.txt && cat MD5.txt
 
       - name: upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kona-baseline
+          name: kona-ohos
           path: ci/artifact
-          retention-days: 7
-
-  probe:
-    name: probe-patches
-    runs-on: ubuntu-22.04
-    timeout-minutes: 60
-    steps:
-      - name: checkout ci
-        uses: actions/checkout@v4
-        with:
-          path: ci
-
-      - name: clone kernel
-        run: |
-          git clone --depth 1 --single-branch -b "$KERNEL_BRANCH" "$KERNEL_REPO" kona
-
-      - name: dry-run patches
-        continue-on-error: true
-        run: |
-          cd kona
-          shopt -s nullglob
-          : > ../ci/patch-probe.txt
-          for p in ../ci/patches/*.patch; do
-            {
-              echo "##### $(basename "$p")"
-              git apply --check "$p" 2>&1 && echo "git-apply: CLEAN" || echo "git-apply: needs fuzz/port"
-              patch -p1 --dry-run --fuzz=3 --no-backup-if-mismatch < "$p" 2>&1 | tail -n 60
-              echo
-            } >> ../ci/patch-probe.txt
-          done
-          cat ../ci/patch-probe.txt
-
-      - name: upload
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: patch-probe
-          path: ci/patch-probe.txt
           retention-days: 7
