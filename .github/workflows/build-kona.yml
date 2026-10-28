@@ -68,7 +68,17 @@ jobs:
               exit 1
             fi
             echo "stub missing kconfig: $miss"
-            mkdir -p "kona/$(dirname "$miss")"
+            # 公开树里很多 OPLUS 路径是悬空符号链接，逐级拆掉再建目录
+            cur="kona"
+            IFS='/' read -ra parts <<< "$(dirname "$miss")"
+            for part in "${parts[@]}"; do
+              cur="$cur/$part"
+              if [ -L "$cur" ]; then rm -f "$cur"; fi
+              if [ -e "$cur" ] && [ ! -d "$cur" ]; then rm -f "$cur"; fi
+              mkdir -p "$cur"
+              git -C kona add -A >/dev/null 2>&1 || true
+            done
+            if [ -L "kona/$miss" ]; then rm -f "kona/$miss"; fi
             printf '# auto-stub: OPLUS feature source not shipped in public tree\n' > "kona/$miss"
             git -C kona add -A
             git -C kona commit -qm "stub $miss"
