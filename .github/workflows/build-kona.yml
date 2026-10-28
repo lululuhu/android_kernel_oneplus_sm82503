@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 env:
-  KERNEL_REPO: https://github.com/OnePlusOSS/android_kernel_oneplus_sm8250.git
-  KERNEL_BRANCH: oneplus/sm8250_u_14.0.0_op9r
+  KERNEL_REPO: https://github.com/LineageOS/android_kernel_oneplus_sm8250.git
+  KERNEL_BRANCH: lineage-24.0
   DEFCONFIG: vendor/kona-perf_defconfig
   MAKE_ARGS: O=out ARCH=arm64 LLVM=1 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 
@@ -44,19 +44,9 @@ jobs:
           git -C kona config user.name ci
           git -C kona log -1 --format='%H %s' | tee ci/kernel-commit.txt
 
-      - name: defconfig (auto-stub missing oplus kconfigs)
+      - name: defconfig (auto-stub missing kconfigs)
         run: |
           set -o pipefail
-          # 这三个 OPLUS 特性目录在公开树里是悬空符号链接（指向未发布的 Android 树路径）
-          for p in kernel/sched_assist kernel/tuning kernel/uad; do
-            if [ -L "kona/$p" ] && [ ! -e "kona/$p" ]; then
-              rm -f "kona/$p"
-              mkdir -p "kona/$p"
-              echo "# auto-stub: OPLUS feature not shipped in public source" > "kona/$p/Kconfig"
-              echo "# auto-stub" > "kona/$p/Makefile"
-              echo "de-symlinked $p"
-            fi
-          done
           for i in $(seq 1 40); do
             if make -C kona $MAKE_ARGS "$DEFCONFIG" > /tmp/dc.log 2>&1; then
               echo "defconfig OK (iterations=$i)"; head -n 5 /tmp/dc.log; break
