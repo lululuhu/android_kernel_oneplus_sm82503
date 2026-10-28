@@ -12,7 +12,6 @@ env:
   KERNEL_REPO: https://github.com/OnePlusOSS/android_kernel_oneplus_sm8250.git
   KERNEL_BRANCH: oneplus/sm8250_u_14.0.0_op9r
   DEFCONFIG: vendor/kona-perf_defconfig
-  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487747c.tar.gz
 
 jobs:
   build:
@@ -30,23 +29,12 @@ jobs:
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             bc bison flex libssl-dev libelf-dev zip unzip cpio rsync lz4 \
+            clang lld llvm \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi device-tree-compiler
-          echo "---- cross gcc ----"
+          echo "---- clang ----"
+          clang --version | head -2
+          ld.lld --version
           aarch64-linux-gnu-gcc --version | head -1
-
-      - name: cache aosp clang
-        uses: actions/cache@v4
-        with:
-          path: ~/clang
-          key: clang-r487747c-v1
-
-      - name: fetch aosp clang
-        run: |
-          if [ ! -x "$HOME/clang/bin/clang" ]; then
-            rm -rf "$HOME/clang"; mkdir -p "$HOME/clang"
-            curl -sL "$CLANG_URL" | tar -xz -C "$HOME/clang"
-          fi
-          "$HOME/clang/bin/clang" --version | head -3
 
       - name: clone kernel
         run: |
@@ -57,8 +45,7 @@ jobs:
         continue-on-error: true
         run: |
           set -o pipefail
-          export PATH="$HOME/clang/bin:$PATH"
-          M="O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+          M="O=out ARCH=arm64 LLVM=1 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
              CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
           make -C kona $M "$DEFCONFIG" 2>&1 | tail -n 20
           make -C kona $M KCFLAGS="-Wno-error" -j"$(nproc)" Image.gz 2>&1 | tee ci/build-baseline.log | tail -n 30
@@ -98,8 +85,7 @@ jobs:
       - name: build PATCHED Image.gz (with ohos config)
         run: |
           set -o pipefail
-          export PATH="$HOME/clang/bin:$PATH"
-          M="O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+          M="O=out ARCH=arm64 LLVM=1 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
              CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
           make -C kona $M "$DEFCONFIG" 2>&1 | tail -n 5
           if make -C kona $M vendor/ohos.config 2>&1 | tail -n 5; then
