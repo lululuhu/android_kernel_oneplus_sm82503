@@ -12,6 +12,7 @@ env:
   KERNEL_REPO: https://github.com/OnePlusOSS/android_kernel_oneplus_sm8250.git
   KERNEL_BRANCH: oneplus/sm8250_u_14.0.0_op9r
   DEFCONFIG: vendor/kona-perf_defconfig
+  MAKE_ARGS: O=out ARCH=arm64 LLVM=1 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 
 jobs:
   build:
@@ -39,27 +40,45 @@ jobs:
       - name: clone kernel
         run: |
           git clone --depth 1 --single-branch -b "$KERNEL_BRANCH" "$KERNEL_REPO" kona
+          git -C kona config user.email ci@local
+          git -C kona config user.name ci
           git -C kona log -1 --format='%H %s' | tee ci/kernel-commit.txt
+
+      - name: defconfig (auto-stub missing oplus kconfigs)
+        run: |
+          set -o pipefail
+          for i in $(seq 1 40); do
+            if make -C kona $MAKE_ARGS "$DEFCONFIG" > /tmp/dc.log 2>&1; then
+              echo "defconfig OK (iterations=$i)"; head -n 5 /tmp/dc.log; break
+            fi
+            miss=$(grep -oP 'can.t open file "\K[^"]+' /tmp/dc.log | head -1)
+            if [ -z "$miss" ]; then
+              echo "---- defconfig failed, no missing kconfig found ----"
+              tail -n 40 /tmp/dc.log
+              exit 1
+            fi
+            echo "stub missing kconfig: $miss"
+            mkdir -p "kona/$(dirname "$miss")"
+            printf '# auto-stub: OPLUS feature source not shipped in public tree\n' > "kona/$miss"
+            git -C kona add -A
+            git -C kona commit -qm "stub $miss"
+          done
+          cp kona/out/.config ci/kona-perf_defconfig.used
 
       - name: build BASELINE Image.gz (no patches)
         continue-on-error: true
         run: |
           set -o pipefail
-          M="O=out ARCH=arm64 LLVM=1 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
-             CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
-          make -C kona $M "$DEFCONFIG" 2>&1 | tail -n 20
-          make -C kona $M KCFLAGS="-Wno-error" -j"$(nproc)" Image.gz 2>&1 | tee ci/build-baseline.log | tail -n 30
+          make -C kona $MAKE_ARGS KCFLAGS="-Wno-error" -j"$(nproc)" Image.gz 2>&1 | tee ci/build-baseline.log | tail -n 30
           mkdir -p ci/artifact/baseline
           cp kona/out/arch/arm64/boot/Image.gz ci/artifact/baseline/
-          cp kona/out/.config ci/artifact/baseline/kona-perf_defconfig.used
+          cp ci/kona-perf_defconfig.used ci/artifact/baseline/kona-perf_defconfig.used 2>/dev/null || true
           tail -n 400 ci/build-baseline.log > ci/artifact/baseline/build-tail.log
           echo "BASELINE OK"
 
       - name: apply ohos patches
         run: |
           cd kona
-          git config user.email ci@local
-          git config user.name ci
           : > ../ci/patch-report.txt
           shopt -s nullglob
           for p in ../ci/patches/*.patch; do
@@ -85,18 +104,16 @@ jobs:
       - name: build PATCHED Image.gz (with ohos config)
         run: |
           set -o pipefail
-          M="O=out ARCH=arm64 LLVM=1 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
-             CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
-          make -C kona $M "$DEFCONFIG" 2>&1 | tail -n 5
-          if make -C kona $M vendor/ohos.config 2>&1 | tail -n 5; then
+          make -C kona $MAKE_ARGS "$DEFCONFIG" 2>&1 | tail -n 5
+          if make -C kona $MAKE_ARGS vendor/ohos.config 2>&1 | tail -n 5; then
             echo "ohos.config merged via make target"
           else
             cat kona/arch/arm64/configs/vendor/ohos.config >> kona/out/.config
             echo "ohos.config appended manually"
           fi
-          make -C kona $M olddefconfig 2>&1 | tail -n 5
+          make -C kona $MAKE_ARGS olddefconfig 2>&1 | tail -n 5
           grep -E 'CONFIG_ACCESS_TOKENID|CONFIG_BINDER_SENDER_INFO|CONFIG_OHOS|CONFIG_DM_PARTNAME' kona/out/.config >> ci/patch-report.txt || true
-          make -C kona $M KCFLAGS="-Wno-error" -j"$(nproc)" Image.gz 2>&1 | tee ci/build-patched.log | tail -n 30
+          make -C kona $MAKE_ARGS KCFLAGS="-Wno-error" -j"$(nproc)" Image.gz 2>&1 | tee ci/build-patched.log | tail -n 30
           mkdir -p ci/artifact/patched
           cp kona/out/arch/arm64/boot/Image.gz ci/artifact/patched/
           cp kona/out/.config ci/artifact/patched/kona-ohos_defconfig.used
@@ -105,6 +122,7 @@ jobs:
       - name: collect
         if: always()
         run: |
+          mkdir -p ci/artifact
           cp ci/patch-report.txt ci/artifact/ 2>/dev/null || true
           cp ci/build-patched.log ci/artifact/ 2>/dev/null || true
           cd ci/artifact && find . -type f -exec md5sum {} \; | sort > MD5.txt && cat MD5.txt
