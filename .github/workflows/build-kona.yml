@@ -75,6 +75,13 @@ jobs:
           done
           cp kona/out/.config ci/kona-perf_defconfig.used
 
+      - name: apply bring-up config
+        run: |
+          cat ci/kona-bringup.config >> kona/out/.config
+          make -C kona $MAKE_ARGS olddefconfig 2>&1 | tail -n 5
+          grep -E 'CONFIG_QPNP_SMB5' kona/out/.config | tee ci/kona-bringup-report.txt || true
+          cp kona/out/.config ci/kona-baseline_defconfig.used
+
       # 基线是硬门禁：失败时 subsequent patched 步骤全部跳过，但日志与 Image.gz 仍上传。
       - name: build BASELINE Image.gz (no patches)
         id: baseline
@@ -122,6 +129,7 @@ jobs:
             cat kona/arch/arm64/configs/vendor/ohos.config >> kona/out/.config
             echo "ohos.config appended manually"
           fi
+          cat ci/kona-bringup.config >> kona/out/.config
           make -C kona $MAKE_ARGS olddefconfig 2>&1 | tail -n 3
           grep -E 'CONFIG_ACCESS_TOKENID|CONFIG_BINDER_SENDER_INFO|CONFIG_ANDROID_BINDERFS|CONFIG_OHOS|CONFIG_DM_PARTNAME|CONFIG_EROFS_FS' kona/out/.config >> ci/patch-report.txt || true
           make -C kona $MAKE_ARGS KCFLAGS="-Wno-error" -j"$(nproc)" \
@@ -140,6 +148,8 @@ jobs:
         if: always()
         run: |
           mkdir -p ci/artifact/baseline
+          cp ci/kona-baseline_defconfig.used ci/artifact/baseline/ 2>/dev/null || true
+          cp ci/kona-bringup-report.txt ci/artifact/baseline/ 2>/dev/null || true
           cp ci/kona-perf_defconfig.used ci/artifact/baseline/ 2>/dev/null || true
           cp ci/build-baseline.log ci/artifact/baseline/ 2>/dev/null || true
           cp ci/build-objects.log ci/artifact/ 2>/dev/null || true
@@ -147,8 +157,9 @@ jobs:
           cp ci/patch-report.txt ci/artifact/ 2>/dev/null || true
           cp ci/reject-*.txt ci/artifact/ 2>/dev/null || true
           if [ -f kona/out/arch/arm64/boot/Image.gz ]; then
-            cp kona/out/arch/arm64/boot/Image.gz ci/artifact/baseline/ || true
-            cp kona/out/.config ci/artifact/baseline/kona-ohos_defconfig.used || true
+            cp kona/out/arch/arm64/boot/Image.gz ci/artifact/ || true
+            cp kona/out/arch/arm64/boot/Image ci/artifact/ 2>/dev/null || true
+            cp kona/out/.config ci/artifact/kona-ohos_defconfig.used || true
             echo "Image.gz present (patched tree)"
           fi
           cd ci/artifact && find . -type f -exec md5sum {} \; | sort > MD5.txt && cat MD5.txt
