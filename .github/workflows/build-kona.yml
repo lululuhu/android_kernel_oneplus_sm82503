@@ -75,67 +75,95 @@ jobs:
           done
           cp kona/out/.config ci/kona-perf_defconfig.used
 
+      # 基线是硬门禁：失败时 subsequent patched 步骤全部跳过，但日志与 Image.gz 仍上传。
       - name: build BASELINE Image.gz (no patches)
+        id: baseline
         continue-on-error: true
         run: |
           set -o pipefail
           make -C kona $MAKE_ARGS KCFLAGS="-Wno-error" -j"$(nproc)" Image.gz 2>&1 | tee ci/build-baseline.log | tail -n 30
-          mkdir -p ci/artifact/baseline
-          cp kona/out/arch/arm64/boot/Image.gz ci/artifact/baseline/
-          cp ci/kona-perf_defconfig.used ci/artifact/baseline/kona-perf_defconfig.used 2>/dev/null || true
-          tail -n 400 ci/build-baseline.log > ci/artifact/baseline/build-tail.log
           echo "BASELINE OK"
 
-      - name: apply ohos patches
+      - name: apply ohos patches (strict, no fuzz)
+        if: steps.baseline.outcome == 'success'
         run: |
           cd kona
           : > ../ci/patch-report.txt
           shopt -s nullglob
+          fail=0
           for p in ../ci/patches/*.patch; do
             n=$(basename "$p")
-            if git apply --check "$p" >/dev/null 2>&1; then
-              git apply "$p" && echo "APPLIED    $n" >> ../ci/patch-report.txt
+            if git apply --check "$p"; then
+              git apply "$p"
+              echo "APPLIED    $n" >> ../ci/patch-report.txt
             else
-              rm -rf /tmp/rej && mkdir -p /tmp/rej
-              patch -p1 --forward --fuzz=3 --no-backup-if-mismatch -r /tmp/rej < "$p" > /tmp/po 2>&1 || true
-              if [ -n "$(ls -A /tmp/rej 2>/dev/null)" ]; then
-                git checkout -- . 2>/dev/null
-                git clean -fdq 2>/dev/null
-                echo "REVERTED   $n" >> ../ci/patch-report.txt
-                continue
-              fi
-              echo "APPLIED-FZ $n" >> ../ci/patch-report.txt
+              git apply --check "$p" > "../ci/reject-$n.txt" 2>&1 || true
+              echo "REJECTED   $n" >> ../ci/patch-report.txt
+              fail=1
             fi
             git add -A >/dev/null 2>&1
             git commit -qm "apply $n" --allow-empty >/dev/null 2>&1
           done
           cat ../ci/patch-report.txt
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::patch set does not apply cleanly on this tree"
+            exit 1
+          fi
 
-      - name: build PATCHED Image.gz (with ohos config)
+      # 先只编译被补丁触及的对象，快速暴露 4.19 适配错误
+      - name: compile touched objects (fast fail)
+        if: steps.baseline.outcome == 'success'
         run: |
           set -o pipefail
-          make -C kona $MAKE_ARGS "$DEFCONFIG" 2>&1 | tail -n 5
-          if make -C kona $MAKE_ARGS vendor/ohos.config 2>&1 | tail -n 5; then
+          make -C kona $MAKE_ARGS "$DEFCONFIG" 2>&1 | tail -n 3
+          if make -C kona $MAKE_ARGS vendor/ohos.config > /tmp/oc.log 2>&1; then
             echo "ohos.config merged via make target"
           else
             cat kona/arch/arm64/configs/vendor/ohos.config >> kona/out/.config
             echo "ohos.config appended manually"
           fi
-          make -C kona $MAKE_ARGS olddefconfig 2>&1 | tail -n 5
-          grep -E 'CONFIG_ACCESS_TOKENID|CONFIG_BINDER_SENDER_INFO|CONFIG_OHOS|CONFIG_DM_PARTNAME' kona/out/.config >> ci/patch-report.txt || true
+          make -C kona $MAKE_ARGS olddefconfig 2>&1 | tail -n 3
+          grep -E 'CONFIG_ACCESS_TOKENID|CONFIG_BINDER_SENDER_INFO|CONFIG_ANDROID_BINDERFS|CONFIG_OHOS|CONFIG_DM_PARTNAME|CONFIG_EROFS_FS' kona/out/.config >> ci/patch-report.txt || true
+          make -C kona $MAKE_ARGS KCFLAGS="-Wno-error" -j"$(nproc)" \
+            kernel/fork.o kernel/reboot.o drivers/tty/sysrq.o \
+            security/selinux/selinuxfs.o block/genhd.o \
+            drivers/android/binder.o drivers/accesstokenid/access_tokenid.o \
+            2>&1 | tee ci/build-objects.log | tail -n 40
+
+      - name: build PATCHED Image.gz (with ohos config)
+        if: steps.baseline.outcome == 'success'
+        run: |
+          set -o pipefail
           make -C kona $MAKE_ARGS KCFLAGS="-Wno-error" -j"$(nproc)" Image.gz 2>&1 | tee ci/build-patched.log | tail -n 30
-          mkdir -p ci/artifact/patched
-          cp kona/out/arch/arm64/boot/Image.gz ci/artifact/patched/
-          cp kona/out/.config ci/artifact/patched/kona-ohos_defconfig.used
-          tail -n 400 ci/build-patched.log > ci/artifact/patched/build-tail.log
 
       - name: collect
         if: always()
         run: |
-          mkdir -p ci/artifact
-          cp ci/patch-report.txt ci/artifact/ 2>/dev/null || true
+          mkdir -p ci/artifact/baseline
+          cp ci/kona-perf_defconfig.used ci/artifact/baseline/ 2>/dev/null || true
+          cp ci/build-baseline.log ci/artifact/baseline/ 2>/dev/null || true
+          cp ci/build-objects.log ci/artifact/ 2>/dev/null || true
           cp ci/build-patched.log ci/artifact/ 2>/dev/null || true
+          cp ci/patch-report.txt ci/artifact/ 2>/dev/null || true
+          cp ci/reject-*.txt ci/artifact/ 2>/dev/null || true
+          if [ -f kona/out/arch/arm64/boot/Image.gz ]; then
+            cp kona/out/arch/arm64/boot/Image.gz ci/artifact/baseline/ || true
+            cp kona/out/.config ci/artifact/baseline/kona-ohos_defconfig.used || true
+            echo "Image.gz present (patched tree)"
+          fi
           cd ci/artifact && find . -type f -exec md5sum {} \; | sort > MD5.txt && cat MD5.txt
+
+      - name: gate
+        if: always()
+        run: |
+          mkdir -p ci/artifact
+          if [ -f kona/out/arch/arm64/boot/Image.gz ] && [ "${{ steps.baseline.outcome }}" != "success" ]; then
+            cp kona/out/arch/arm64/boot/Image.gz ci/artifact/baseline/ 2>/dev/null || true
+          fi
+          if [ "${{ steps.baseline.outcome }}" != "success" ]; then
+            echo "::error::baseline build failed - fix tree/toolchain before patching"
+            exit 1
+          fi
 
       - name: upload
         if: always()
